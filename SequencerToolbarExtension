@@ -1,0 +1,802 @@
+#include "SequencerToolbarExtension.h"
+#include "TKExtension.h"
+#include "TKExtensionCommands.h"
+#include "MiscBPLibrary.h"
+#include "TKExtensionSettings.h"
+#include "TKExtensionUtils.h"
+#include "MovieSceneBPLibrary.h"
+#include "TKLibrary.h"
+
+#include "LevelSequenceModule.h"
+#include "Modules/ModuleManager.h"
+#include "Interfaces/IPluginManager.h"
+#include "LevelEditor.h"
+#include "DesktopPlatformModule.h"
+#include "EditorDirectories.h"
+#include "Editor.h"
+#include "LevelEditorViewport.h"
+#include "EditorUtilityLibrary.h"
+#include "ExtensionLibraries/MovieSceneSequenceExtensions.h"
+#include "ExtensionLibraries/MovieSceneTrackExtensions.h"
+#include "ExtensionLibraries/MovieSceneSectionExtensions.h"
+#include "ExtensionLibraries/MovieSceneBindingExtensions.h"
+#include "Algo/Find.h"
+
+#include "Sequencer.h"
+#include "ObjectBindingTagCache.h"
+
+#include "Animation/SkeletalMeshActor.h"
+#include "GeometryCacheActor.h"
+#include "GeometryCacheComponent.h"
+#include "GeometryCache.h"
+#include "MovieSceneGeometryCacheSection.h"
+#include "MovieSceneGeometryCacheTrack.h"
+#include "Tracks/MovieSceneSkeletalAnimationTrack.h"
+#include "Tracks/MovieSceneSpawnTrack.h"
+#include "MovieSceneToolHelpers.h"
+#include "MovieSceneToolsUserSettings.h"
+#include "CineCameraActor.h"
+#include "CineCameraComponent.h"
+#include "MovieScene.h"
+#include "LevelSequence.h"
+#include "ISequencerModule.h"
+#include "ExtensionStyle.h"
+#include "MovieSceneBindingProxy.h"
+#include "SequencerUtilities.h"
+#include "Tracks/MovieSceneCameraCutTrack.h"
+#include "EventHandlers/ISequenceDataEventHandler.h"
+
+#include "Misc/FbxErrors.h"
+
+
+
+#define LOCTEXT_NAMESPACE "SequenceExtension"
+
+
+void FSequencerToolbarExtension::AddToolbarExtension(FToolBarBuilder& Builder)
+{
+	//Add S2P Button
+	Builder.AddToolBarButton(
+		FTKExtensionCommands::Get().S2PButton,
+		NAME_None,
+		LOCTEXT("S2P", " S2P "),
+		LOCTEXT("S2PTooltip", "转换所有的spawnables成possessables"),
+		FSlateIcon(FExtensionStyle::GetStyleSetName(), "S2P")
+	);
+	//Add CamR Button
+	Builder.AddToolBarButton(
+		FTKExtensionCommands::Get().CamReimportButton,
+		NAME_None,
+		LOCTEXT("CamReimport", "CamR"),
+		LOCTEXT("CamReimportTooltip", "重导入相机"),
+		FSlateIcon(FExtensionStyle::GetStyleSetName(), "CamR")
+	);
+	//Add AniImport Button
+	Builder.AddToolBarButton(
+		FTKExtensionCommands::Get().AniImportButton,
+		NAME_None,
+		LOCTEXT("AniImport", "Import"),
+		LOCTEXT("AniImportTooltip", "导入选中的动画资产，包括动画序列和几何体缓存（GeometryCache）"),
+		FSlateIcon(FExtensionStyle::GetStyleSetName(), "Import")
+	);
+
+
+
+}
+
+void FSequencerToolbarExtension::CheckForCameraUpdates()
+{
+	TSharedPtr<ISequencer> Sequencer = FTKExtensionModule::GetSequencer();
+	UMovieScene* MovieScene = Sequencer->GetRootMovieSceneSequence()->GetMovieScene();
+
+	const TArray<FMovieSceneBinding>& Bindings = MovieScene->GetBindings();
+	for (const FMovieSceneBinding& Binding : Bindings)
+	{
+		FGuid ObjectBindingID = Binding.GetObjectGuid();
+		UObject* BoundObject = Sequencer->FindSpawnedObjectOrTemplate(ObjectBindingID);
+		ACineCameraActor* CineCameraActor = Cast<ACineCameraActor>(BoundObject);
+		if (CineCameraActor)
+		{
+			TArray<FName> TagNames = TKExtensionUtils::GetObjectBindingTags(Sequencer, ObjectBindingID);
+			if (TagNames.Num() == 2)
+			{
+				FString Name1 = TagNames[0].ToString();
+				FString Name2 = TagNames[1].ToString();
+				FString FilePath;
+				FString DateTime;
+				//Locate Path
+				if (Name1.StartsWith(TEXT("Path:")))
+				{
+					FilePath = Name1.RightChop(5);
+				}
+				else
+				{
+					FilePath = Name2.RightChop(5);
+				}
+				//Locate Time
+				if (Name1.StartsWith(TEXT("Time:")))
+				{
+					DateTime = Name1.RightChop(5);
+				}
+				else
+				{
+					DateTime = Name2.RightChop(5);
+				}
+				FDateTime LastTimestamp;
+				if (FDateTime::ParseIso8601(*DateTime, LastTimestamp) && IFileManager::Get().FileExists(*FilePath) 
+				  &&IFileManager::Get().GetTimeStamp(*FilePath) > LastTimestamp)
+				{
+					FSimpleDelegate OnReimportConfirmed = FSimpleDelegate::CreateLambda([this]()
+						{
+							OnCamReimportButtonClicked();
+						});
+
+					FVector2D ClientSize = FVector2D(400, 200);
+					UObject* ObjectSetting = nullptr;
+					TKExtensionUtils::ShowConfirmationDialog(LOCTEXT("CamReimportTitle", "相机重导入"), LOCTEXT("CamReimportMessage", "检测到相机有更新，请问是否重导入？"), LOCTEXT("CamReimportWarning", ""), OnReimportConfirmed, FSimpleDelegate(), ClientSize, ObjectSetting);
+					return;
+				}
+
+
+			}
+			return;
+		}
+	}
+}
+
+void FSequencerToolbarExtension::OnS2PButtonClicked()
+{
+	TSharedPtr<ISequencer> Sequencer = FTKExtensionModule::GetSequencer();
+	UMovieSceneSequence* Sequence = Sequencer->GetRootMovieSceneSequence();
+	ULevelSequence* LevelSequence = Cast<ULevelSequence>(Sequence);
+	Sequencer->SetLocalTime(FFrameTime(-1));
+	if (Sequence)
+	{
+		UMovieScene* MovieScene = Sequence->GetMovieScene();
+		if (!MovieScene)
+		{
+			
+			UMiscBPLibrary::NotificationText(INVTEXT("非法MovieScene"), true, false);
+			return;
+		}
+		int32 SpawnableCount = MovieScene->GetSpawnableCount();
+		int32 TempCount = SpawnableCount;
+		if (SpawnableCount == 0)
+		{
+			UMiscBPLibrary::NotificationText(INVTEXT("当前定序器没有Spawnable!"), true, false);
+			return;
+		}
+		while (SpawnableCount > 0)
+		{
+			FMovieSceneSpawnable& Spawnable = MovieScene->GetSpawnable(0);
+			const FGuid& SpawnableGuid = Spawnable.GetGuid();
+
+			FMovieSceneBindingProxy PossessableProxy;
+			if (FMovieScenePossessable* Possessable = FSequencerUtilities::ConvertToPossessable(FTKExtensionModule::GetSequencer(), SpawnableGuid))
+			{
+				bool bSuccess;
+				FString Message;
+				
+				ASkeletalMeshActor* SkelActor = Cast<ASkeletalMeshActor>(UMovieSceneBPLibrary::GetActorFromGuidInLevelSequence(Possessable->GetGuid(), LevelSequence, bSuccess, Message));
+				if (SkelActor)
+				{
+					SkelActor->GetSkeletalMeshComponent()->AnimationData.bSavedPlaying = false;
+				}
+				PossessableProxy = FMovieSceneBindingProxy(Possessable->GetGuid(), Sequence);
+				SpawnableCount = MovieScene->GetSpawnableCount();
+			}
+		}
+
+		UMiscBPLibrary::NotificationText(FText::Format(INVTEXT("{0} Spawnables 已转为 Possessables!"), TempCount), true, true);
+
+		//Sort Camera Cut Track
+		UMovieSceneTrack* CameraCutTrack = MovieScene->GetCameraCutTrack();
+		if (CameraCutTrack)
+			MovieScene->EventHandlers.Trigger(&UE::MovieScene::ISequenceDataEventHandler::OnTrackAdded, CameraCutTrack);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("No active movie scene sequence found!"));
+	}
+}
+
+void FSequencerToolbarExtension::OnCamReimportButtonClicked()
+{
+	TSharedPtr<ISequencer> Sequencer = FTKExtensionModule::GetSequencer();
+	TArray<FGuid> CamBindingIDs;
+	UObject* BoundObject = nullptr;
+	ACineCameraActor* CineCameraActor = nullptr;
+	
+	UMovieSceneSequence* MovieSceneSequence = Sequencer->GetFocusedMovieSceneSequence();
+	ULevelSequence* LevelSequence = Cast<ULevelSequence>(MovieSceneSequence);
+	UMovieScene* MovieScene = MovieSceneSequence->GetMovieScene();
+
+	if (!LevelSequence)
+	{
+		UMiscBPLibrary::NotificationText(INVTEXT("找不到关卡序列！"), true, false);
+		return;
+	}
+
+	UTKExtensionSettings* ExtensionSettings = GetMutableDefault<UTKExtensionSettings>();
+	check(ExtensionSettings);
+
+
+	auto ResetCameraFilmback = [this, &ExtensionSettings, &CineCameraActor](const FString& FileName)
+	{
+		if (ExtensionSettings->bEnableFilmbackSetup)
+		{
+			CineCameraActor->GetCineCameraComponent()->SetFilmbackPresetByName(ExtensionSettings->DefaultFilmbackPreset);
+
+			UDataTable* DataTable = ExtensionSettings->OptionalCameraMap.LoadSynchronous();
+			if (DataTable != nullptr)
+			{
+				FString ShotString;
+				TKExtensionUtils::ExtractCameraShotString(FileName, ShotString);
+				FCameraMap* CameraMap = DataTable->FindRow<FCameraMap>(*ShotString, "");
+				if (CameraMap)
+				{
+					FString Software = CameraMap->Software;
+					if (Software == FString("maya"))
+					{
+						CineCameraActor->GetCineCameraComponent()->SetFilmbackPresetByName(TEXT("16:9 DSLR"));
+					}
+					else if (Software == TEXT("3dmax"))
+					{
+						CineCameraActor->GetCineCameraComponent()->SetFilmbackPresetByName(TEXT("16:9 Digital Film"));
+					}
+				}
+			}
+		}
+	};
+
+	auto ReimportFunc = [this, &MovieSceneSequence, LevelSequence, &Sequencer, &ExtensionSettings, &MovieScene](TMap<FGuid, FString>& InObjectBindingMap, const FString& OpenFilename) -> bool
+	{
+		
+		UMovieSceneUserImportFBXSettings* ImportFBXSettings = GetMutableDefault<UMovieSceneUserImportFBXSettings>();
+		ImportFBXSettings->bMatchByNameOnly = false;
+		FFBXInOutParameters InOutParams;
+
+		TArray<FGuid> Guids;
+		InObjectBindingMap.GenerateKeyArray(Guids);
+		check(Guids.Num() == 1);
+		FGuid CameraBindingID = Guids[0];
+
+		if (!MovieSceneToolHelpers::ReadyFBXForImport(OpenFilename, ImportFBXSettings, InOutParams))
+		{
+			UMiscBPLibrary::NotificationText(INVTEXT("相机fbx导入失败！"), true, false);
+/*			if (FileNames.Contains(OpenFilename))
+			{
+				TSoftObjectPtr<ULevelSequence> Key = *ExtensionSettings->SequenceCamPathMap.FindKey(OpenFilename);
+				ExtensionSettings->SequenceCamPathMap.Remove(Key);
+				if (ExtensionSettings->SequenceCamTimestampMap.Contains(Key))
+				{
+					ExtensionSettings->SequenceCamTimestampMap.Remove(Key);
+				}
+				ExtensionSettings->SaveConfig(CPF_Config, *ExtensionSettings->GetDefaultConfigFilename());
+			}	*/		
+
+			return false;
+		}
+
+		const FScopedTransaction Transaction(NSLOCTEXT("MovieSceneTools", "ImportFBXTransaction", "Import FBX"));
+		UnFbx::FFbxImporter* FbxImporter = UnFbx::FFbxImporter::GetInstance();
+
+		bool bMatchByNameOnly = ImportFBXSettings->bMatchByNameOnly;
+		if (InObjectBindingMap.Num() == 1 && bMatchByNameOnly)
+		{
+			UE_LOG(LogMovieScene, Display, TEXT("Fbx Import: Importing onto one selected binding, disabling match by name only."));
+			bMatchByNameOnly = false;
+		}
+
+		// Import static cameras first
+		MovieSceneSequence->Modify();
+		ImportFBXCamera(FbxImporter, MovieSceneSequence, *Sequencer, InObjectBindingMap, bMatchByNameOnly, false);
+
+		UWorld* World = Cast<UWorld>(Sequencer->GetPlaybackContext());
+		bool bValid = MovieSceneToolHelpers::ImportFBXIfReady(World, MovieSceneSequence, Sequencer.Get(), Sequencer->GetFocusedTemplateID(), InObjectBindingMap, ImportFBXSettings, InOutParams);
+		if (!bValid)
+		{
+			/*if (FileNames.Contains(OpenFilename))
+			{
+				TSoftObjectPtr<ULevelSequence> Key = *ExtensionSettings->SequenceCamPathMap.FindKey(OpenFilename);
+				ExtensionSettings->SequenceCamPathMap.Remove(Key);
+				if (ExtensionSettings->SequenceCamTimestampMap.Contains(Key))
+				{
+					ExtensionSettings->SequenceCamTimestampMap.Remove(Key);
+				}
+				ExtensionSettings->SaveConfig(CPF_Config, *ExtensionSettings->GetDefaultConfigFilename());
+				return false;
+			}*/
+			UMiscBPLibrary::NotificationText(INVTEXT("相机fbx导入失败！"), true, false);
+			return false;
+		}
+		else
+		{
+			//Import succeeded
+			//New way to store cam data
+			FScopedTransaction ScopedTransaction(LOCTEXT("UpdateTags", "Update Camera Tags"));
+
+			FMovieSceneSequenceID SequenceID = Sequencer->GetFocusedTemplateID();
+			FString CurTimestampStr = IFileManager::Get().GetTimeStamp(*OpenFilename).ToIso8601();		
+			TArray<FName> Tags = TKExtensionUtils::GetObjectBindingTags(Sequencer, CameraBindingID);
+			for (FName& Tag : Tags)
+			{
+				TKExtensionUtils::RemoveObjectBindingTag(Sequencer, CameraBindingID, Tag);
+			}
+
+			TKExtensionUtils::AddObjectBindingTag(Sequencer, CameraBindingID, FName(TEXT("Time:") + CurTimestampStr));
+			TKExtensionUtils::AddObjectBindingTag(Sequencer,CameraBindingID, FName(TEXT("Path:") + OpenFilename));
+
+			//TSoftObjectPtr<ULevelSequence> SoftObjectPtr(LevelSequence);
+			//if (!FileNames.Contains(OpenFilename))
+			//{								
+			//	ExtensionSettings->SequenceCamPathMap.Add(SoftObjectPtr, OpenFilename);
+			//	ExtensionSettings->SequenceCamTimestampMap.Add(SoftObjectPtr, IFileManager::Get().GetTimeStamp(*OpenFilename).ToIso8601());
+			//	ExtensionSettings->SaveConfig(CPF_Config, *ExtensionSettings->GetDefaultConfigFilename());
+			//}
+			//else
+			//{			
+			//	if(ExtensionSettings->SequenceCamTimestampMap.Contains(SoftObjectPtr))
+			//	{
+			//		ExtensionSettings->SequenceCamTimestampMap[SoftObjectPtr] = IFileManager::Get().GetTimeStamp(*OpenFilename).ToIso8601();
+			//		ExtensionSettings->SaveConfig(CPF_Config, *ExtensionSettings->GetDefaultConfigFilename());
+			//	}
+			//	else
+			//	{
+			//		ExtensionSettings->SequenceCamTimestampMap.Add(SoftObjectPtr, IFileManager::Get().GetTimeStamp(*OpenFilename).ToIso8601());
+			//		ExtensionSettings->SaveConfig(CPF_Config, *ExtensionSettings->GetDefaultConfigFilename());
+			//	}
+			//}
+			Sequencer->NotifyMovieSceneDataChanged(EMovieSceneDataChangeType::MovieSceneStructureItemAdded);
+			return true;
+		}
+		return true;
+	};
+	auto CamReimportFunc = [this, &Sequencer, &LevelSequence, &ExtensionSettings, &ReimportFunc](TMap<FGuid, FString>& InObjectBindingMap, FString& InFileName)
+	{
+		TArray<FGuid> Guids;
+		InObjectBindingMap.GenerateKeyArray(Guids);
+		check(Guids.Num() == 1);
+		TArray<FName> Tags = TKExtensionUtils::GetObjectBindingTags(Sequencer, Guids[0]);
+		bool bPathExist = false;
+		FName TagPathName;
+		for (FName& Tag : Tags)
+		{
+			if (Tag.ToString().StartsWith(TEXT("Path:")))
+			{
+				bPathExist = true;
+				TagPathName = Tag;
+				break;
+			}
+		}
+
+//		TSoftObjectPtr<ULevelSequence> SeqSoftObjPtr = LevelSequence;
+//		if (!ExtensionSettings->SequenceCamPathMap.Contains(SeqSoftObjPtr))
+		if(!bPathExist)
+		{
+			TArray<FString> OpenFileNames;
+			if (!OpenFBXWindow(OpenFileNames))
+				return;
+			if(ReimportFunc(InObjectBindingMap, OpenFileNames[0]))
+				InFileName = OpenFileNames[0];
+			
+		}
+		else
+		{
+//			FString OpenFileName = ExtensionSettings->SequenceCamPathMap[SeqSoftObjPtr];
+			FString OpenFileName = TagPathName.ToString().RightChop(5);
+			if(!IFileManager::Get().FileExists(*OpenFileName))
+			{
+				UMiscBPLibrary::NotificationText(FText::Format(INVTEXT("相机 fbx文件：{0} 不存在，请重新制定相机文件！"), FText::FromString(OpenFileName)));
+				TArray<FString> OpenFileNames;
+				if (!OpenFBXWindow(OpenFileNames))
+					return;
+				if (ReimportFunc(InObjectBindingMap, OpenFileNames[0]))
+					InFileName = OpenFileNames[0];
+			}
+			else
+			{
+				if (ReimportFunc(InObjectBindingMap, OpenFileName))
+					InFileName = OpenFileName;
+			}
+		}
+
+	};
+	auto GetCamBindingsFunc = [&LevelSequence, &MovieScene, &ExtensionSettings, &Sequencer, &BoundObject, &CineCameraActor, &CamReimportFunc, &ResetCameraFilmback]()
+	{
+		const TArray<FMovieSceneBinding>& Bindings = MovieScene->GetBindings();
+		for (const FMovieSceneBinding& Binding : Bindings)
+		{
+			FGuid ObjectBindingID = Binding.GetObjectGuid();
+			BoundObject = Sequencer->FindSpawnedObjectOrTemplate(ObjectBindingID);
+			CineCameraActor = Cast<ACineCameraActor>(BoundObject);
+			if (CineCameraActor)
+			{
+				TMap<FGuid, FString> ObjectBindingMap;
+				ObjectBindingMap.Add(ObjectBindingID, CineCameraActor->GetActorLabel());
+				//Reimport Camera
+				FString FileName;
+				CamReimportFunc(ObjectBindingMap, FileName);
+		
+				if (!FileName.IsEmpty())
+				{
+					const FScopedTransaction Transaction(TEXT("Change Camera Name"), LOCTEXT("ChangeName", "Change Camera Name"), CineCameraActor);
+					CineCameraActor->Modify();
+					CineCameraActor->SetActorLabel(FPaths::GetBaseFilename(FileName));
+				}
+					
+				//Reset Filmback			
+				ResetCameraFilmback(FileName);			
+				return;
+			}
+		}
+
+		UMiscBPLibrary::NotificationText(INVTEXT("找不到相机"), true, false);
+		return;
+
+	};
+
+	Sequencer->GetSelectedObjects(CamBindingIDs);
+
+	if (CamBindingIDs.Num() == 1)
+	{
+		BoundObject = Sequencer->FindSpawnedObjectOrTemplate(CamBindingIDs[0]);
+		CineCameraActor = Cast<ACineCameraActor>(BoundObject);
+		if (CineCameraActor)
+		{			
+			TMap<FGuid, FString> ObjectBindingMap;
+			ObjectBindingMap.Add(CamBindingIDs[0], CineCameraActor->GetActorLabel());
+			//Reimport Camera
+			FString FileName;
+			CamReimportFunc(ObjectBindingMap, FileName);
+			if(!FileName.IsEmpty())
+			{
+				const FScopedTransaction Transaction(TEXT("Change Camera Name"), LOCTEXT("ChangeName", "Change Camera Name"), CineCameraActor);
+				CineCameraActor->Modify();
+				CineCameraActor->SetActorLabel(FPaths::GetBaseFilename(FileName));
+			}
+
+			//Reset Filmback
+			ResetCameraFilmback(FileName);			
+			return;
+		}
+		else
+		{
+			GetCamBindingsFunc();
+		}
+	}
+	else
+	{
+		GetCamBindingsFunc();
+	}
+	
+
+}
+
+void FSequencerToolbarExtension::OnAniImportButtonClicked()
+{
+	TSharedRef<ISequencer> Sequencer = FTKExtensionModule::GetSequencer();
+	UMovieSceneSequence* MovieSceneSequence = Sequencer->GetFocusedMovieSceneSequence();
+	UMovieScene* MovieScene = MovieSceneSequence->GetMovieScene();
+	UTKExtensionSettings* ExtensionSettings = GetMutableDefault<UTKExtensionSettings>();
+
+	bool bExecuted = false;
+
+	if(!MovieSceneSequence || !MovieScene)
+		return;
+	TArray<UObject*> Objects = UEditorUtilityLibrary::GetSelectedAssets();
+	if (Objects.Num() == 0)
+	{
+		UMiscBPLibrary::NotificationText(INVTEXT("未选中任何资产！"), true, false);
+		return;
+	}
+
+	Sequencer->SetLocalTime(FFrameTime(-1));
+
+	const FScopedTransaction Transaction(NSLOCTEXT("MovieSceneTools", "ImportAnimationToSequencer", "Import Selected Animation Assets To Sequencer"));
+
+	for (UObject* Object : Objects)
+	{
+
+		UWorld* World = Sequencer->GetPlaybackContext()->GetWorld();
+
+		UAnimSequence* AnimSequence = Cast<UAnimSequence>(Object);
+
+		//Anim Sequence
+		if (AnimSequence)
+		{
+			ULevelSequence* LevelSequence = Cast<ULevelSequence>(MovieSceneSequence);
+
+			USkeleton* Skeleton = AnimSequence->GetSkeleton();
+			ASkeletalMeshActor* TempActor = World->SpawnActor<ASkeletalMeshActor>();
+			TempActor->GetSkeletalMeshComponent()->SetSkeletalMesh(Skeleton->GetPreviewMesh());
+			TempActor->SetActorLabel(AnimSequence->GetName());
+			bool bSuccess; 
+			FString InfoMessage;
+
+			FGuid NewGuid = UMovieSceneBPLibrary::AddActorIntoLevelSequence(TempActor, LevelSequence, bSuccess, InfoMessage);
+
+			//FMovieScenePossessable* Possessable = FSequencerUtilities::ConvertToPossessable(FTKExtensionModule::GetSequencer(), NewGuid);
+			//NewGuid = Possessable->GetGuid();
+			//FGuid NewGuid = MovieScene->AddPossessable(AnimSequence->GetName(), AnimSequence->GetClass());
+
+			FMovieSceneBindingProxy ObjectBinding(NewGuid, MovieSceneSequence);
+			LevelSequence->BindPossessableObject(NewGuid, *TempActor, TempActor->GetWorld());
+			//Add track
+			UClass* DesiredClass = UMovieSceneSkeletalAnimationTrack::StaticClass();
+			UMovieSceneTrack* NewAniTrack = nullptr;
+			const bool bBindingExists = Algo::FindBy(MovieScene->GetBindings(), ObjectBinding.BindingID, &FMovieSceneBinding::GetObjectGuid) != nullptr;
+			if (bBindingExists)
+			{
+				NewAniTrack = NewObject<UMovieSceneTrack>(MovieScene, DesiredClass, NAME_None, RF_Transactional);
+				if (NewAniTrack)
+				{
+					MovieScene->AddGivenTrack(NewAniTrack, ObjectBinding.BindingID);
+				}
+				else
+				{
+					FText InvariantPart = INVTEXT("资产 {0} 存在问题，无法导入！");
+					UMiscBPLibrary::NotificationText(FText::Format(InvariantPart, FText::FromString(AnimSequence->GetName())), true, false);
+					continue;
+				}					
+			}
+			else
+			{
+				FText InvariantPart = INVTEXT("资产 {0} 存在问题，无法导入！");
+				UMiscBPLibrary::NotificationText(FText::Format(InvariantPart, FText::FromString(AnimSequence->GetName())), true, false);
+				continue;
+			}
+			UMovieSceneSkeletalAnimationTrack* AnimTrack = Cast<UMovieSceneSkeletalAnimationTrack>(NewAniTrack);
+			//Add section
+			UMovieSceneSection* NewAniSection = UMovieSceneBPLibrary::AddSection(AnimTrack);
+			UMovieSceneSkeletalAnimationSection* AnimSection = Cast<UMovieSceneSkeletalAnimationSection>(NewAniSection);
+			AnimSection->Params.Animation = AnimSequence;
+			//Set range
+			UMovieSceneBPLibrary::SetSectionRange(MovieSceneSequence, AnimSection, 0, AnimSequence->GetNumberOfSampledKeys() - 1);
+
+			//Set pre post roll frames
+			if (ExtensionSettings->bEnablePrePostRollFrames)
+			{
+				UMovieSceneBPLibrary::SetRollFrames(MovieSceneSequence, AnimSection, ExtensionSettings->PreRollFrames, ExtensionSettings->PostRollFrames);
+			}
+
+			bExecuted = true;
+			FMovieScenePossessable* Possessable = FSequencerUtilities::ConvertToPossessable(Sequencer,  ObjectBinding.BindingID);
+			Sequencer->SelectObject(Possessable->GetGuid());
+			/*bool bSuccess;
+			FString Message;*/
+			ASkeletalMeshActor* SkelActor = Cast<ASkeletalMeshActor>(UMovieSceneBPLibrary::GetActorFromGuidInLevelSequence(Possessable->GetGuid(), LevelSequence, bSuccess, InfoMessage));
+			if (SkelActor)
+			{
+				SkelActor->GetSkeletalMeshComponent()->AnimationData.bSavedPlaying = false;
+			}
+		}
+
+
+		//Geometry Cache
+		else
+		{
+			UGeometryCache* GeometryCache = Cast<UGeometryCache>(Object);
+			if (GeometryCache)
+			{
+				ULevelSequence* LevelSequence = Cast<ULevelSequence>(MovieSceneSequence);
+				
+				AGeometryCacheActor* TempActor = World->SpawnActor<AGeometryCacheActor>();
+				TempActor->GetGeometryCacheComponent()->SetGeometryCache(GeometryCache);
+				TempActor->SetActorLabel(GeometryCache->GetName());
+				bool bSuccess;
+				FString InfoMessage;
+
+				FGuid NewGuid = UMovieSceneBPLibrary::AddActorIntoLevelSequence(TempActor, LevelSequence, bSuccess, InfoMessage);
+				
+				//FGuid NewGuid = UMovieSceneBPLibrary::CreateNewSpawnable(MovieSceneSequence, GeometryCache);
+			
+				//const FGuid NewGuid = MovieScene->AddPossessable(GeometryCache->GetName(), GeometryCache->GetClass());
+				FMovieSceneBindingProxy ObjectBinding(NewGuid, MovieSceneSequence);
+				LevelSequence->BindPossessableObject(NewGuid, *TempActor, TempActor->GetWorld());
+				//Add track
+				UClass* DesiredClass = UMovieSceneGeometryCacheTrack::StaticClass();
+				UMovieSceneTrack* NewGeoTrack = nullptr;
+				const bool bBindingExists = Algo::FindBy(MovieScene->GetBindings(), ObjectBinding.BindingID, &FMovieSceneBinding::GetObjectGuid) != nullptr;
+				if (bBindingExists)
+				{
+					NewGeoTrack = NewObject<UMovieSceneTrack>(MovieScene, DesiredClass, NAME_None, RF_Transactional);
+					if (NewGeoTrack)
+					{
+						MovieScene->AddGivenTrack(NewGeoTrack, ObjectBinding.BindingID);
+					}
+					else
+						return;
+				}	
+				UMovieSceneGeometryCacheTrack* GeoTrack = Cast<UMovieSceneGeometryCacheTrack>(NewGeoTrack);
+				//Add section
+				UMovieSceneSection* NewGeoSection = UMovieSceneBPLibrary::AddSection(GeoTrack);
+				UMovieSceneGeometryCacheSection* GeoSection = Cast<UMovieSceneGeometryCacheSection>(NewGeoSection);
+				GeoSection->Params.GeometryCacheAsset = GeometryCache;
+				//Set range
+				UMovieSceneBPLibrary::SetSectionRange(MovieSceneSequence, GeoSection, 0, GeometryCache->GetEndFrame() - GeometryCache->GetStartFrame());
+			
+				//Set pre post roll frames
+				if (ExtensionSettings->bEnablePrePostRollFrames)
+				{
+					UMovieSceneBPLibrary::SetRollFrames(MovieSceneSequence, GeoSection, ExtensionSettings->PreRollFrames, ExtensionSettings->PostRollFrames);
+				}
+				bExecuted = true;
+				FMovieScenePossessable* Possessable = FSequencerUtilities::ConvertToPossessable(Sequencer, ObjectBinding.BindingID);
+				Sequencer->SelectObject(Possessable->GetGuid());
+
+				/*bool bSuccess;
+				FString Message;*/
+				AGeometryCacheActor* GeoActor = Cast<AGeometryCacheActor>(UMovieSceneBPLibrary::GetActorFromGuidInLevelSequence(Possessable->GetGuid(), LevelSequence, bSuccess, InfoMessage));
+				if (GeoActor)
+				{
+					GeoActor->GetGeometryCacheComponent()->SetManualTick(true);
+				}
+			}
+		}
+	}
+
+
+	//Sort Camera Cut Track
+	UMovieSceneTrack* CameraCutTrack = MovieScene->GetCameraCutTrack();
+	if (CameraCutTrack && bExecuted)
+	{
+		MovieScene->EventHandlers.Trigger(&UE::MovieScene::ISequenceDataEventHandler::OnTrackAdded, CameraCutTrack);
+	}
+		
+}
+
+void FSequencerToolbarExtension::ExtendSequencerToolMenu()
+{
+	FTKExtensionCommands::Register();
+	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FSequencerToolbarExtension::RegisterMenus));
+}
+
+void FSequencerToolbarExtension::RegisterMenus()
+{
+	TSharedPtr<FUICommandList> CommandList = MakeShareable(new FUICommandList);
+	CommandList->MapAction(FTKExtensionCommands::Get().S2PButton,
+		FExecuteAction::CreateRaw(this, &FSequencerToolbarExtension::OnS2PButtonClicked));
+
+	UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("Sequencer.MainMenu.ToolMenu");
+	FToolMenuSection& Section  = Menu->FindOrAddSection("CustomMenu");
+	Section.AddMenuEntryWithCommandList(
+		FTKExtensionCommands::Get().S2PButton,
+		CommandList,
+		TAttribute<FText>(),
+		TAttribute<FText>(),
+		FSlateIcon(FExtensionStyle::GetStyleSetName(), "S2P")
+	);
+
+
+}
+
+
+bool FSequencerToolbarExtension::OpenFBXWindow(TArray<FString>& OpenFilenames)
+{
+	if(OpenFilenames.Num() > 0)
+		OpenFilenames.Empty();
+	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
+	bool bOpen = false;
+	if (DesktopPlatform)
+	{
+		FString ExtensionStr;
+		ExtensionStr += TEXT("FBX (*.fbx)|*.fbx|");
+
+		bOpen = DesktopPlatform->OpenFileDialog(
+			FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr),
+			LOCTEXT("ImportFBX", "Import FBX from...").ToString(),
+			FEditorDirectories::Get().GetLastDirectory(ELastDirectory::FBX),
+			TEXT(""),
+			*ExtensionStr,
+			EFileDialogFlags::None,
+			OpenFilenames
+		);
+	}
+	if (!bOpen)
+	{
+		return false;
+	}
+
+	if (!OpenFilenames.Num())
+	{
+		return false;
+	}
+	return true;
+}
+
+void FSequencerToolbarExtension::ImportFBXCamera(UnFbx::FFbxImporter* FbxImporter, UMovieSceneSequence* InSequence, ISequencer& InSequencer, TMap<FGuid, FString>& InObjectBindingMap, bool bMatchByNameOnly, bool bCreateCameras)
+{
+	bool bNotifySlate = !FApp::IsUnattended() && !GIsRunningUnattendedScript;
+
+	UMovieScene* MovieScene = InSequence->GetMovieScene();
+
+	TArray<FbxCamera*> AllCameras;
+	MovieSceneToolHelpers::GetCameras(FbxImporter->Scene->GetRootNode(), AllCameras);
+	if (AllCameras.Num() == 0)
+	{
+		return;
+	}
+
+	if (bCreateCameras)
+	{
+		UWorld* World = GCurrentLevelEditingViewportClient ? GCurrentLevelEditingViewportClient->GetWorld() : nullptr;
+
+		// Find unmatched cameras
+		TArray<FbxCamera*> UnmatchedCameras;
+		for (auto Camera : AllCameras)
+		{
+			FString NodeName = MovieSceneToolHelpers::GetCameraName(Camera);
+
+			bool bMatched = false;
+			for (auto InObjectBinding : InObjectBindingMap)
+			{
+				FString ObjectName = InObjectBinding.Value;
+				if (ObjectName == NodeName)
+				{
+					// Look for a valid bound object, otherwise need to create a new camera and assign this binding to it
+					bool bFoundBoundObject = false;
+					TArrayView<TWeakObjectPtr<>> BoundObjects = InSequencer.FindBoundObjects(InObjectBinding.Key, InSequencer.GetFocusedTemplateID());
+					for (auto BoundObject : BoundObjects)
+					{
+						if (BoundObject.IsValid())
+						{
+							bFoundBoundObject = true;
+							break;
+						}
+					}
+				}
+			}
+
+			if (!bMatched)
+			{
+				UnmatchedCameras.Add(Camera);
+			}
+		}
+
+		// If there are new cameras, clear the object binding map so that we're only assigning values to the newly created cameras
+		if (UnmatchedCameras.Num() != 0)
+		{
+			InObjectBindingMap.Reset();
+			bMatchByNameOnly = true;
+		}
+
+		// Add any unmatched cameras
+		for (auto UnmatchedCamera : UnmatchedCameras)
+		{
+			FString CameraName = MovieSceneToolHelpers::GetCameraName(UnmatchedCamera);
+
+			AActor* NewCamera = nullptr;
+			if (UnmatchedCamera->GetApertureMode() == FbxCamera::eFocalLength)
+			{
+				FActorSpawnParameters SpawnParams;
+				NewCamera = World->SpawnActor<ACineCameraActor>(SpawnParams);
+				NewCamera->SetActorLabel(*CameraName);
+			}
+			else
+			{
+				FActorSpawnParameters SpawnParams;
+				NewCamera = World->SpawnActor<ACameraActor>(SpawnParams);
+				NewCamera->SetActorLabel(*CameraName);
+			}
+
+			// Copy camera properties before adding default tracks so that initial camera properties match and can be restored after sequencer finishes
+			MovieSceneToolHelpers::CopyCameraProperties(UnmatchedCamera, NewCamera);
+
+			TArray<TWeakObjectPtr<AActor> > NewCameras;
+			NewCameras.Add(NewCamera);
+			TArray<FGuid> NewCameraGuids = InSequencer.AddActors(NewCameras);
+
+			if (NewCameraGuids.Num())
+			{
+				InObjectBindingMap.Add(NewCameraGuids[0]);
+				InObjectBindingMap[NewCameraGuids[0]] = CameraName;
+			}
+		}
+	}
+
+	MovieSceneToolHelpers::ImportFBXCameraToExisting(FbxImporter, InSequence, &InSequencer, InSequencer.GetFocusedTemplateID(), InObjectBindingMap, bMatchByNameOnly, true);
+}
+
+
+#undef LOCTEXT_NAMESPACE
